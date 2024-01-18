@@ -45,6 +45,8 @@ class Hcorpus():
         self.fileset_sub_idx = fileset_sub_idx
         if self.fileset_sub_idx < 0:  # 再读上一个太复杂了，直接放弃
             self.fileset_sub_idx = 0
+        if self.fileset_idx >= len(self.fileset):
+            self.fileset_idx = 0
         self.cache = self.fileset[self.fileset_idx]
         self.fileset_idx += 1
         self.cache_idx = self.fileset_sub_idx
@@ -63,7 +65,7 @@ class Hcorpus():
         return retn
 
     def __repr__(self):
-        return f"Hcorpus(r'{self.fileset.root}', fileset_idx={self.fileset_idx}, fileset_sub_idx={self.fileset_sub_idx})"
+        return f"Hcorpus(r'{self.fileset.root}', fileset_idx={self.fileset_idx-1}, fileset_sub_idx={self.fileset_sub_idx})"
 
 if __name__ == '__main__':
     filePath = r'D:\datasets\h-corpus'

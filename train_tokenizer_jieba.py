@@ -23,5 +23,7 @@ for i in tqdm(range(2001, len(filePath)), desc="Converting"):
             pickle.dump(wSet, file)
         print(i)
 
+with open('tmp_wSet.final.pkl', 'wb') as file:
+    pickle.dump(wSet, file)
 
 

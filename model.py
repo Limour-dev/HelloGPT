@@ -33,26 +33,26 @@ class RotaryEmbedding(nn.Module):
         freqs = torch.outer(t, freqs).float()  # 外积
         self.freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # 复数，模 1，角度 freqs
         self.freqs_cis.requires_grad = False  # filter(lambda p : p.requires_grad, model.parameters())
+        self.local_freqs_cis = None
+
+    def reshape_for_broadcast(self, x: torch.Tensor):
+        ndim = x.ndim
+        shape = (d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape))
+        self.local_freqs_cis = self.local_freqs_cis.view(*shape)
+
+    def rotary_emb(self, xq, xk):
+        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+        if len(self.local_freqs_cis.shape) == 2:
+            self.reshape_for_broadcast(xq_)
+        xq_out = torch.view_as_real(xq_ * self.local_freqs_cis).flatten(3)
+        xk_out = torch.view_as_real(xk_ * self.local_freqs_cis).flatten(3)
+        return xq_out.type_as(xq), xk_out.type_as(xk)
 
     def forward(self, start_pos: int, seqlen: int):
-        local_freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen]  # cacheKV 相关，可忽略
-        local_freqs_cis.requires_grad = False
-
-        def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-            ndim = x.ndim
-            assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-            shape = (d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape))
-            return freqs_cis.view(*shape)
-
-        def rotary_emb(xq, xk, freqs_cis=local_freqs_cis):
-            xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-            xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-            freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-            xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-            xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-            return xq_out.type_as(xq), xk_out.type_as(xk)
-
-        return rotary_emb
+        self.local_freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen]  # cacheKV 相关，可忽略
+        self.local_freqs_cis.requires_grad = False
+        return self.rotary_emb
 
     def __repr__(self):
         return f'RotaryEmbedding(heads_dim={self.heads_dim}, max_seq_len={self.max_seq_len})'
@@ -73,7 +73,7 @@ class Attention(nn.Module):
             self.cache_k = torch.zeros(max_batch_size, max_seq_len, self.n_heads, self.head_dim).to(device)
             self.cache_v = torch.zeros(max_batch_size, max_seq_len, self.n_heads, self.head_dim).to(device)
 
-    def forward(self, hidden_states, rotary_emb, start_pos=0, mask=None):
+    def forward(self, hidden_states, rotary_emb, start_pos=0, mask=None, is_causal=True):
         bsz, seqlen, hidden_size = hidden_states.shape
 
         q = self.q_proj(hidden_states)
@@ -96,7 +96,8 @@ class Attention(nn.Module):
         k = k.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         v = v.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
 
-        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        # print(is_causal, mask is None)
+        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=is_causal)
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, hidden_size)
         return self.o_proj(output)
@@ -124,8 +125,8 @@ class Decoder(nn.Module):
         self.ln2 = RMSNorm(hidden_size)
         self.mlp = MLP(hidden_size)
 
-    def forward(self, x, rotary_emb, start_pos, mask=None):
-        x += self.attn(self.ln1(x), rotary_emb, start_pos, mask)
+    def forward(self, x, rotary_emb, start_pos, mask=None, is_causal=True):
+        x += self.attn(self.ln1(x), rotary_emb, start_pos, mask, is_causal)
         return x + self.mlp(self.ln2(x))
 
 
@@ -152,15 +153,16 @@ class HelloGPT(nn.Module):
         self.norm = RMSNorm(hidden_size)
         self.ln2 = nn.Linear(hidden_size, vocab_size, bias=False)
 
-    def forward(self, input_ids: torch.Tensor, start_pos=0):
+    def forward(self, input_ids: torch.Tensor, start_pos=0, no_mask=True):
         _bsz, seqlen = input_ids.shape
         h = self.tok_embeddings(input_ids)
 
         # 预计算，减少每一层的重复计算
         rotary_emb = self.rotary_emb(start_pos, seqlen)
-        mask = None if seqlen <= 1 else getMask(seqlen, h.type(), self.cacheKV, start_pos)
+        mask = None if no_mask or seqlen <= 1 else getMask(seqlen, h.type(), self.cacheKV, start_pos)
+        is_causal = no_mask and (seqlen > 1)  # 似乎 SDPA 比预计算 mask 还快
         for layer in self.layers:
-            h = layer(h, rotary_emb, start_pos, mask)
+            h = layer(h, rotary_emb, start_pos, mask, is_causal)
 
         h = self.norm(h)
         h = self.ln2(h)

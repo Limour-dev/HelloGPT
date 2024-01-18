@@ -139,7 +139,7 @@ def getMask(seqlen, type, cacheKV, start_pos, device=device):
 
 
 class HelloGPT(nn.Module):
-    def __init__(self, vocab_size=16382, hidden_size=768, n_heads=12, max_seq_len=512, n_layers=12, cacheKV=False, max_batch_size=1):
+    def __init__(self, vocab_size=32765, hidden_size=768, n_heads=12, max_seq_len=1024, n_layers=12, cacheKV=False, max_batch_size=1):
         super().__init__()
         # hidden_size > 8.33 * ln(vocab_size)
         self.cacheKV = cacheKV  # cacheKV 相关，可忽略
@@ -168,10 +168,10 @@ class HelloGPT(nn.Module):
 
 
 if __name__ == '__main__':
-    # from h_corpus import Hcorpus
-    # data = Hcorpus(r'D:\datasets\h-corpus')
-    # context_tokens = data()
-    context_tokens = [1,2,3]
+    from h_corpus import Hcorpus
+    data = Hcorpus(r'D:\datasets\h-corpus')
+    context_tokens = data()
+    # context_tokens = [0,2,32764]
     input_ids = torch.tensor([context_tokens]).to(device)
     tmp = HelloGPT()
     tmp.to(device)

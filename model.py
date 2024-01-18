@@ -126,7 +126,7 @@ class Decoder(nn.Module):
         self.mlp = MLP(hidden_size)
 
     def forward(self, x, rotary_emb, start_pos, mask=None, is_causal=True):
-        x += self.attn(self.ln1(x), rotary_emb, start_pos, mask, is_causal)
+        x = x + self.attn(self.ln1(x), rotary_emb, start_pos, mask, is_causal)
         return x + self.mlp(self.ln2(x))
 
 

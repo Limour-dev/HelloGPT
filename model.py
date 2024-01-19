@@ -24,38 +24,42 @@ class RMSNorm(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, heads_dim: int, max_seq_len: int, device=device, theta: float = 10000.0):
+    def __init__(self, head_dim: int, max_seq_len: int, device=device, theta: float = 10000.0):
         super().__init__()
-        self.heads_dim = heads_dim
+        self.head_dim = head_dim
+        self.set_max_seq_len(max_seq_len, device, theta)
+
+    def set_max_seq_len(self, max_seq_len: int, device=device, theta: float = 10000.0):
         self.max_seq_len = max_seq_len
-        freqs = 1.0 / (theta ** (torch.arange(0, heads_dim, 2).float().to(device) / heads_dim))
+        freqs = 1.0 / (theta ** (torch.arange(0, self.head_dim, 2).float().to(device) / self.head_dim))
         t = torch.arange(max_seq_len, device=device)  # type: ignore
         freqs = torch.outer(t, freqs).float()  # 外积
         self.freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # 复数，模 1，角度 freqs
         self.freqs_cis.requires_grad = False  # filter(lambda p : p.requires_grad, model.parameters())
-        self.local_freqs_cis = None
 
-    def reshape_for_broadcast(self, x: torch.Tensor):
-        ndim = x.ndim
-        shape = (d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape))
-        self.local_freqs_cis = self.local_freqs_cis.view(*shape)
-
-    def rotary_emb(self, xq, xk):
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        if len(self.local_freqs_cis.shape) == 2:
-            self.reshape_for_broadcast(xq_)
-        xq_out = torch.view_as_real(xq_ * self.local_freqs_cis).flatten(3)
-        xk_out = torch.view_as_real(xk_ * self.local_freqs_cis).flatten(3)
-        return xq_out.type_as(xq), xk_out.type_as(xk)
+    def rotary_emb(self, x):
+        x_ = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+        x_out = torch.view_as_real(x_ * self.local_freqs_cis).flatten(3)
+        return x_out.type_as(x)
 
     def forward(self, start_pos: int, seqlen: int):
-        self.local_freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen]  # cacheKV 相关，可忽略
+        self.local_freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen].view(1, seqlen, 1, -1)  # cacheKV 相关，可忽略
         self.local_freqs_cis.requires_grad = False
         return self.rotary_emb
 
+    def inverse_rotary_emb(self, x):
+        x_ = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+        x_out = torch.view_as_real(x_ * self.local_freqs_cis_inverse).flatten(3)
+        return x_out.type_as(x)
+
+    def inverse_forward(self, start_pos: int, seqlen: int):
+        self.local_freqs_cis_inverse = self.freqs_cis[start_pos: start_pos + seqlen].view(1, seqlen, 1, -1)  # cacheKV 相关，可忽略
+        self.local_freqs_cis_inverse = self.local_freqs_cis_inverse.conj()  # 乘上共轭就旋转回去了
+        self.local_freqs_cis.requires_grad = False
+        return self.inverse_rotary_emb
+
     def __repr__(self):
-        return f'RotaryEmbedding(heads_dim={self.heads_dim}, max_seq_len={self.max_seq_len})'
+        return f'RotaryEmbedding(head_dim={self.head_dim}, max_seq_len={self.max_seq_len})'
 
 
 class Attention(nn.Module):
@@ -84,7 +88,8 @@ class Attention(nn.Module):
         k = k.view(bsz, seqlen, self.n_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_heads, self.head_dim)
 
-        q, k = rotary_emb(q, k)
+        q = rotary_emb(q)
+        k = rotary_emb(k)
 
         if self.cacheKV:  # cacheKV 相关，可忽略
             self.cache_k[:bsz, start_pos: start_pos + seqlen] = k
@@ -101,6 +106,14 @@ class Attention(nn.Module):
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, hidden_size)
         return self.o_proj(output)
+
+    def streaming_llm(self, start_pos, seqlen, to_pos, inverse_rotary_emb, rotary_emb, bsz):
+        k = self.cache_k[:bsz, start_pos: start_pos + seqlen]
+        v = self.cache_v[:bsz, start_pos: start_pos + seqlen]
+        k = inverse_rotary_emb(k)
+        k = rotary_emb(k)
+        self.cache_k[:bsz, to_pos: to_pos + seqlen] = k
+        self.cache_v[:bsz, to_pos: to_pos + seqlen] = v
 
 
 class MLP(nn.Module):
@@ -145,7 +158,7 @@ class HelloGPT(nn.Module):
         # hidden_size > 8.33 * ln(vocab_size)
         self.cacheKV = cacheKV  # cacheKV 相关，可忽略
         self.tok_embeddings = nn.Embedding(vocab_size, hidden_size)
-        self.rotary_emb = RotaryEmbedding(hidden_size // n_heads, max_seq_len * 2)
+        self.rotary_emb = RotaryEmbedding(hidden_size // n_heads, max_seq_len)
         self.rotary_emb.requires_grad = False
         self.layers = nn.ModuleList()
         for layer_id in range(n_layers):
@@ -153,13 +166,13 @@ class HelloGPT(nn.Module):
         self.norm = RMSNorm(hidden_size)
         self.ln2 = nn.Linear(hidden_size, vocab_size, bias=False)
 
-    def forward(self, input_ids: torch.Tensor, start_pos=0, no_mask=True):
+    def forward(self, input_ids: torch.Tensor, start_pos=0, no_mask=True, com_mask=None):
         _bsz, seqlen = input_ids.shape
         h = self.tok_embeddings(input_ids)
 
         # 预计算，减少每一层的重复计算
         rotary_emb = self.rotary_emb(start_pos, seqlen)
-        mask = None if no_mask or seqlen <= 1 else getMask(seqlen, h.type(), self.cacheKV, start_pos)
+        mask = com_mask if no_mask or seqlen <= 1 else getMask(seqlen, h.type(), self.cacheKV, start_pos)
         is_causal = no_mask and (seqlen > 1)  # 似乎 SDPA 比预计算 mask 还快
         for layer in self.layers:
             h = layer(h, rotary_emb, start_pos, mask, is_causal)
@@ -167,6 +180,12 @@ class HelloGPT(nn.Module):
         h = self.norm(h)
         h = self.ln2(h)
         return h.float()
+
+    def streaming_llm(self, start_pos, seqlen, to_pos, max_batch_size=1):
+        rotary_emb = self.rotary_emb(to_pos, seqlen)
+        inverse_rotary_emb = self.rotary_emb.inverse_forward(start_pos, seqlen)
+        for layer in self.layers:
+            layer.attn.streaming_llm(start_pos, seqlen, to_pos, inverse_rotary_emb, rotary_emb, max_batch_size)
 
 
 if __name__ == '__main__':
@@ -177,4 +196,17 @@ if __name__ == '__main__':
     input_ids = torch.tensor([context_tokens]).to(device)
     tmp = HelloGPT()
     tmp.to(device)
-    tmp2 = tmp(input_ids)
+    with torch.no_grad():
+        tmp2 = tmp(input_ids)
+        tmp3 = torch.rand(1, 10, 12, 64, device=device)
+        tmp4 = RotaryEmbedding(64, 12)
+        tmp7 = tmp3.float()
+        tmp5 = tmp4(0, 10)
+        tmp8 = tmp4.inverse_forward(0, 10)
+        for i in range(1000):
+            tmp6 = tmp5(tmp7)
+            tmp7 = tmp8(tmp6)
+            if not torch.allclose(tmp3, tmp7, atol=1e-4):
+                print(i)  # 800+
+                break
+            print(torch.allclose(tmp3, tmp6, atol=1e-4), torch.allclose(tmp3, tmp7, atol=1e-4), torch.equal(tmp3, tmp7))

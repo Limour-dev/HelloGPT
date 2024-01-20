@@ -1,6 +1,8 @@
 from opencc import OpenCC
 cc = OpenCC('t2s')  # 't2s'表示繁体转简体
 from tqdm import tqdm
+import gzip
+from h_corpus import Fileset
 
 # 示例
 traditional_text = "簡體轉換範例"
@@ -10,14 +12,13 @@ print(f"简体: {simplified_text}")
 
 import os
 
-filePath = r'D:\datasets\h-corpus'
-filePath = [os.path.join(filePath, f) for f in os.listdir(filePath) if f.endswith('txt')]
+filePath = Fileset(r'D:\datasets\b-corpus\unclear', ext='.txt.gz')
 
-for path in tqdm(filePath, desc="Converting"):
-    with open(path, 'r', encoding='utf-8') as f:
+for path in tqdm((filePath[i] for i in range(len(filePath))), desc="Converting"):
+    with gzip.open(path, 'rt', encoding='utf-8') as f:
         tmp = f.read()
     s_tmp = cc.convert(tmp)
     if s_tmp != tmp:
         print(path)
-        with open(path, 'w', encoding='utf-8') as f:
+        with gzip.open(path, 'wt', encoding='utf-8') as f:
             f.write(s_tmp)

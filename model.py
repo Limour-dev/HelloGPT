@@ -72,10 +72,17 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
+        self.set_cacheKV(cacheKV, max_batch_size, max_seq_len, device)
+
+    def set_cacheKV(self, cacheKV, max_batch_size, max_seq_len, device=device):
         self.cacheKV = cacheKV
-        if cacheKV:  # cacheKV 相关，可忽略
+        if self.cacheKV:
             self.cache_k = torch.zeros(max_batch_size, max_seq_len, self.n_heads, self.head_dim).to(device)
             self.cache_v = torch.zeros(max_batch_size, max_seq_len, self.n_heads, self.head_dim).to(device)
+        else:
+            self.cache_k = None
+            self.cache_v = None
+
 
     def forward(self, hidden_states, rotary_emb, start_pos=0, mask=None, is_causal=True):
         bsz, seqlen, hidden_size = hidden_states.shape
@@ -180,6 +187,11 @@ class HelloGPT(nn.Module):
         h = self.norm(h)
         h = self.ln2(h)
         return h.float()
+
+    def set_cacheKV(self, cacheKV, max_seq_len, max_batch_size=1):
+        self.rotary_emb.set_max_seq_len(max_seq_len)
+        for layer in self.layers:
+            layer.attn.set_cacheKV(cacheKV, max_batch_size, max_seq_len)
 
     def streaming_llm(self, start_pos, seqlen, to_pos, max_batch_size=1):
         rotary_emb = self.rotary_emb(to_pos, seqlen)
